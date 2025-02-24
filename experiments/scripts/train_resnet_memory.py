@@ -66,33 +66,40 @@ class Memory:
                 self.labels.append(label.cpu())
                 self.is_new.append(True)
 
-    def get_training_batch(self, batch_size=32, new_ratio=0.8):
-        """Get a batch with mostly new examples and some old ones"""
+    def get_training_batch(self, batch_size=32):
+        """Get a batch with ratio of new/old based on memory contents"""
         if len(self) == 0:
             return None, None
 
+        # Count new vs old examples
+        n_new = sum(1 for x in self.is_new if x)
+        n_old = len(self) - n_new
+
+        # Set ratio based on actual proportions
+        if n_new == 0:  # All old
+            new_ratio = 0
+        elif n_old == 0:  # All new
+            new_ratio = 1
+        else:
+            # Use the actual proportion, but ensure some mixing
+            new_ratio = min(0.8, max(0.2, n_new / len(self)))
+
         # How many new examples to include
-        n_new = int(batch_size * new_ratio)
-        n_old = batch_size - n_new
+        n_new_batch = int(batch_size * new_ratio)
+        n_old_batch = batch_size - n_new_batch
 
         # Get indices of new and old examples
         new_indices = [i for i, is_new in enumerate(self.is_new) if is_new]
         old_indices = [i for i, is_new in enumerate(self.is_new) if not is_new]
 
-        # If we don't have enough new/old, adjust ratios
-        if len(new_indices) < n_new:
-            n_new = len(new_indices)
-            n_old = min(batch_size - n_new, len(old_indices))
-        if len(old_indices) < n_old:
-            n_old = len(old_indices)
-            n_new = min(batch_size - n_old, len(new_indices))
-
         # Sample indices
         batch_indices = []
-        if n_new > 0:
-            batch_indices.extend(random.sample(new_indices, n_new))
-        if n_old > 0:
-            batch_indices.extend(random.sample(old_indices, n_old))
+        if n_new_batch > 0 and new_indices:
+            n_new_batch = min(n_new_batch, len(new_indices))
+            batch_indices.extend(random.sample(new_indices, n_new_batch))
+        if n_old_batch > 0 and old_indices:
+            n_old_batch = min(n_old_batch, len(old_indices))
+            batch_indices.extend(random.sample(old_indices, n_old_batch))
         random.shuffle(batch_indices)
 
         return (
@@ -109,15 +116,15 @@ class Memory:
 
 
 def train_on_memory(model, memory, device, target_acc=0.95, max_steps=50):
-    """Train primarily on new examples with some old ones mixed in"""
+    """Train on memory with adaptive ratios"""
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
     for step in range(max_steps):
-        # Get a batch of examples (80% new, 20% old)
-        inputs, targets = memory.get_training_batch(batch_size=128, new_ratio=0.8)
-        if inputs is None:  # Empty memory
+        # Get a batch of examples with adaptive ratio
+        inputs, targets = memory.get_training_batch(batch_size=128)
+        if inputs is None:
             break
 
         inputs = inputs.clone().detach().requires_grad_(True)
@@ -196,21 +203,24 @@ def main():
     )
 
     # Create model
-    model = SimpleNet().to(device)  # Using our simple network instead of ResNet18
+    model = SimpleNet().to(device)
     memory = Memory(max_size=50000)
     mistakes_before_training = 32
     min_memory_size = 128
     mistakes_since_training = 0
+    correct_streak = 0  # Track consecutive correct predictions
+    min_streak = 50  # Minimum correct predictions before counting mistakes
     criterion = nn.CrossEntropyLoss()
 
     # Training loop
     print("Starting training...")
     for epoch in range(10):
-        model.eval()  # Start in eval mode
+        model.eval()
         running_loss = 0
         correct = 0
         total = 0
-        mistakes_since_training = 0  # Reset mistakes counter each epoch
+        mistakes_since_training = 0
+        correct_streak = 0  # Reset streak each epoch
 
         pbar = tqdm(train_loader, desc=f"E{epoch}", ncols=80)
         for inputs, targets in pbar:
@@ -222,19 +232,25 @@ def main():
             _, predicted = outputs.max(1)
             mistakes = ~predicted.eq(targets)
 
-            # If we made mistakes, add them to memory
-            if mistakes.any():
-                memory.add(inputs[mistakes], targets[mistakes])
-                mistakes_since_training += mistakes.sum().item()
+            # Update streak
+            if not mistakes.any():
+                correct_streak += 1
+            else:
+                # Only count mistakes if we were on a good streak
+                if correct_streak >= min_streak:
+                    memory.add(inputs[mistakes], targets[mistakes])
+                    mistakes_since_training += mistakes.sum().item()
+                correct_streak = 0
 
-                # If we've accumulated enough mistakes and have enough memory, train
-                if (
-                    mistakes_since_training >= mistakes_before_training
-                    and len(memory) >= min_memory_size
-                ):
-                    train_on_memory(model, memory, device)
-                    mistakes_since_training = 0
-                    model.eval()  # Back to eval mode
+            # Train if we've accumulated enough mistakes after a good streak
+            if (
+                mistakes_since_training >= mistakes_before_training
+                and len(memory) >= min_memory_size
+            ):
+                train_on_memory(model, memory, device)
+                mistakes_since_training = 0
+                correct_streak = 0
+                model.eval()
 
             # Update stats
             total += targets.size(0)
@@ -243,7 +259,7 @@ def main():
 
             # Progress bar
             pbar.set_postfix_str(
-                f"m:{len(memory)} mi:{mistakes_since_training} a:{100.0*correct/total:.1f}%"
+                f"m:{len(memory)} s:{correct_streak} a:{100.0*correct/total:.1f}%"
             )
 
         # Final evaluation
